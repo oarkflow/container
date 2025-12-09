@@ -437,11 +437,7 @@ func (s *Server) validatePaths(payload *execRequestPayload) error {
 	}
 
 	// Validate working directory
-	if payload.WorkingDir != "" {
-		if err := s.checkPathWithinRoot(payload.WorkingDir, "working directory"); err != nil {
-			return err
-		}
-	} else {
+	if payload.WorkingDir == "" {
 		// If no working directory specified, set it to rootDir
 		payload.WorkingDir = s.rootDir
 	}
