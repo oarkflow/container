@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,13 +22,20 @@ type ServerConfig struct {
 	ChunkSize       int
 	MaxResultBuffer int
 	Logger          *log.Logger
+	RootDir         string // If set, restricts all operations to this directory
+	UseChrootIfRoot bool   // If true and running as root, use chroot for isolation
+	AllowInsecure   bool   // If true, allow interpreter execution without chroot (INSECURE - dev only)
 }
 
 // Server executes guest commands upon requests from the host.
 type Server struct {
-	chunkSize int
-	bufLimit  int
-	logger    *log.Logger
+	chunkSize       int
+	bufLimit        int
+	logger          *log.Logger
+	rootDir         string          // If set, restricts all operations to this directory
+	chrootExecutor  *ChrootExecutor // Used for OS-level isolation when available
+	useChrootIfRoot bool
+	allowInsecure   bool // Allow interpreter execution without chroot (INSECURE)
 }
 
 // NewServer constructs a new agent server with sane defaults.
@@ -43,7 +52,44 @@ func NewServer(cfg ServerConfig) *Server {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Server{chunkSize: chunk, bufLimit: limit, logger: logger}
+	rootDir := ""
+	var chrootExec *ChrootExecutor
+	if cfg.RootDir != "" {
+		var err error
+		rootDir, err = filepath.Abs(cfg.RootDir)
+		if err != nil {
+			logger.Printf("warning: invalid root dir %q: %v", cfg.RootDir, err)
+		} else {
+			logger.Printf("restricting operations to: %s", rootDir)
+
+			// Try to set up chroot if requested
+			if cfg.UseChrootIfRoot {
+				chrootExec, err = NewChrootExecutor(rootDir)
+				if err != nil {
+					logger.Printf("ERROR: chroot setup failed: %v", err)
+					logger.Printf("ERROR: Cannot provide secure isolation - aborting")
+					logger.Printf("HINT: Run with 'sudo' or use --no-chroot flag (insecure for untrusted code)")
+					panic(fmt.Sprintf("chroot required but failed: %v", err))
+				} else if chrootExec.RequiresRoot() {
+					logger.Printf("ERROR: chroot requires root privileges")
+					logger.Printf("ERROR: Cannot provide secure isolation - aborting")
+					logger.Printf("HINT: Run with 'sudo' or use --no-chroot flag (insecure for untrusted code)")
+					panic("chroot required but not running as root")
+				} else {
+					logger.Printf("✓ chroot isolation enabled - secure execution mode")
+				}
+			}
+		}
+	}
+	return &Server{
+		chunkSize:       chunk,
+		bufLimit:        limit,
+		logger:          logger,
+		rootDir:         rootDir,
+		chrootExecutor:  chrootExec,
+		useChrootIfRoot: cfg.UseChrootIfRoot,
+		allowInsecure:   cfg.AllowInsecure,
+	}
 }
 
 // Serve accepts incoming connections and handles them concurrently.
@@ -116,6 +162,28 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) runExec(conn net.Conn, dec *json.Decoder, writer *frameWriter, payload execRequestPayload) {
+	// Validate paths if rootDir is set (note: this only validates arguments, not script contents)
+	if s.rootDir != "" {
+		if s.chrootExecutor == nil {
+			// Without chroot, we only have weak path validation
+			if err := s.validatePaths(&payload); err != nil {
+				_ = writer.send(frameTypeError, errorPayload{Message: "security violation: " + err.Error()})
+				return
+			}
+
+			// Block interpreters without chroot unless explicitly allowed
+			if s.isInterpreter(payload.Path) && !s.allowInsecure {
+				s.logger.Printf("ERROR: refusing to execute interpreter %q without chroot isolation", payload.Path)
+				_ = writer.send(frameTypeError, errorPayload{
+					Message: fmt.Sprintf("security error: cannot execute interpreter %q without chroot isolation - scripts can escape root directory. Start agent with 'sudo' for secure mode", payload.Path),
+				})
+				return
+			} else if s.isInterpreter(payload.Path) && s.allowInsecure {
+				s.logger.Printf("WARNING: executing interpreter %q in INSECURE mode - scripts can escape root directory!", payload.Path)
+			}
+		}
+	}
+
 	execCtx := context.Background()
 	if payload.TimeoutMilli > 0 {
 		var cancel context.CancelFunc
@@ -126,6 +194,14 @@ func (s *Server) runExec(conn net.Conn, dec *json.Decoder, writer *frameWriter, 
 	command := exec.CommandContext(execCtx, payload.Path, payload.Args...)
 	command.Dir = payload.WorkingDir
 	command.Env = flattenEnv(nil, payload.Env)
+
+	// Apply chroot isolation if available
+	if s.chrootExecutor != nil {
+		if err := s.chrootExecutor.PrepareCommand(command, payload.WorkingDir); err != nil {
+			_ = writer.send(frameTypeError, errorPayload{Message: "chroot setup failed: " + err.Error()})
+			return
+		}
+	}
 
 	stdinPipe, err := command.StdinPipe()
 	if err != nil {
@@ -320,4 +396,125 @@ func (s *Server) handleFileGet(writer *frameWriter, payload fileGetRequestPayloa
 			return
 		}
 	}
+}
+
+// validatePaths ensures that all paths in the exec request are within the rootDir boundary.
+func (s *Server) validatePaths(payload *execRequestPayload) error {
+	if s.rootDir == "" {
+		return nil
+	}
+
+	// Reject shell interpreters when rootDir is set UNLESS they're executing a script file within root
+	shellCommands := []string{"/bin/sh", "/bin/bash", "/bin/zsh", "sh", "bash", "zsh",
+		"cmd.exe", "powershell.exe", "pwsh.exe", "cmd", "powershell", "pwsh"}
+	isShell := false
+	for _, shell := range shellCommands {
+		if strings.HasSuffix(payload.Path, shell) || payload.Path == shell {
+			isShell = true
+			break
+		}
+	}
+
+	if isShell {
+		// Check if shell is executing a script file (not using -c flag)
+		hasScriptArg := false
+		for _, arg := range payload.Args {
+			// If it's -c flag, reject it (inline commands can bypass restrictions)
+			if arg == "-c" {
+				return fmt.Errorf("shell commands with -c flag are not allowed when root directory isolation is enabled")
+			}
+			// Check if there's a script file argument
+			if !strings.HasPrefix(arg, "-") && (strings.HasSuffix(arg, ".sh") || strings.HasSuffix(arg, ".bash") ||
+				strings.HasSuffix(arg, ".ps1") || strings.HasSuffix(arg, ".bat") || strings.HasSuffix(arg, ".cmd")) {
+				hasScriptArg = true
+			}
+		}
+
+		// If no script file found, reject the shell command
+		if !hasScriptArg {
+			return fmt.Errorf("shell commands without script files are not allowed when root directory isolation is enabled")
+		}
+	}
+
+	// Validate working directory
+	if payload.WorkingDir != "" {
+		if err := s.checkPathWithinRoot(payload.WorkingDir, "working directory"); err != nil {
+			return err
+		}
+	} else {
+		// If no working directory specified, set it to rootDir
+		payload.WorkingDir = s.rootDir
+	}
+
+	// Validate the command path itself if it's a relative path
+	if !filepath.IsAbs(payload.Path) && (strings.Contains(payload.Path, "/") || strings.Contains(payload.Path, "\\")) {
+		absPath := filepath.Clean(filepath.Join(payload.WorkingDir, payload.Path))
+		relPath, err := filepath.Rel(s.rootDir, absPath)
+		if err != nil || strings.HasPrefix(relPath, "..") {
+			return fmt.Errorf("command path %q escapes root %q", payload.Path, s.rootDir)
+		}
+	}
+
+	// Check all arguments for file paths that might escape
+	for i, arg := range payload.Args {
+		// Check if argument looks like a file path (but not command flags like -c, --flag, etc.)
+		if (strings.Contains(arg, "/") || strings.Contains(arg, "\\")) && !strings.HasPrefix(arg, "-") {
+			// Resolve path relative to working directory
+			var absPath string
+			if filepath.IsAbs(arg) {
+				absPath = filepath.Clean(arg)
+			} else {
+				absPath = filepath.Clean(filepath.Join(payload.WorkingDir, arg))
+			}
+
+			// Check if resolved path is within rootDir
+			relPath, err := filepath.Rel(s.rootDir, absPath)
+			if err != nil || strings.HasPrefix(relPath, "..") {
+				return fmt.Errorf("argument %d path %q escapes root %q (resolves to %q)", i, arg, s.rootDir, absPath)
+			}
+		}
+	}
+
+	return nil
+}
+
+// isInterpreter checks if the command is a script interpreter
+func (s *Server) isInterpreter(cmdPath string) bool {
+	interpreters := []string{
+		"python", "python2", "python3",
+		"node", "nodejs",
+		"ruby", "irb",
+		"php",
+		"perl",
+		"lua",
+		"java", "javac",
+		"go", "gofmt",
+		"bash", "sh", "zsh", "fish", "ksh",
+		"cmd.exe", "powershell.exe", "pwsh.exe",
+	}
+
+	baseName := filepath.Base(cmdPath)
+	for _, interp := range interpreters {
+		if baseName == interp || strings.HasPrefix(baseName, interp) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkPathWithinRoot verifies a single path is within the root directory.
+func (s *Server) checkPathWithinRoot(path, pathType string) error {
+	var absPath string
+	if filepath.IsAbs(path) {
+		absPath = filepath.Clean(path)
+	} else {
+		absPath = filepath.Clean(filepath.Join(s.rootDir, path))
+	}
+
+	relPath, err := filepath.Rel(s.rootDir, absPath)
+	if err != nil || strings.HasPrefix(relPath, "..") {
+		return fmt.Errorf("%s %q is outside root %q", pathType, path, s.rootDir)
+	}
+
+	return nil
 }

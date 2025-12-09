@@ -3,8 +3,11 @@ package agent
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +32,14 @@ func (l *LoopbackClient) Ping(ctx context.Context) error { return nil }
 
 func (l *LoopbackClient) Exec(ctx context.Context, cmd *CommandRequest) (*CommandResult, error) {
 	start := time.Now()
+
+	// Validate working directory to prevent path traversal
+	if cmd.WorkingDir != "" {
+		if err := validateWorkingDir(cmd); err != nil {
+			return nil, fmt.Errorf("security violation: %w", err)
+		}
+	}
+
 	command := exec.CommandContext(ctx, cmd.Path, cmd.Args...)
 	command.Env = flattenEnv(l.baseEnv, cmd.Env)
 	command.Dir = cmd.WorkingDir
@@ -84,6 +95,13 @@ func (l *LoopbackClient) Exec(ctx context.Context, cmd *CommandRequest) (*Comman
 }
 
 func (l *LoopbackClient) ExecStream(ctx context.Context, cmd *CommandRequest) (*CommandStream, error) {
+	// Validate working directory to prevent path traversal
+	if cmd.WorkingDir != "" {
+		if err := validateWorkingDir(cmd); err != nil {
+			return nil, fmt.Errorf("security violation: %w", err)
+		}
+	}
+
 	command := exec.CommandContext(ctx, cmd.Path, cmd.Args...)
 	command.Env = flattenEnv(l.baseEnv, cmd.Env)
 	command.Dir = cmd.WorkingDir
@@ -168,4 +186,42 @@ func streamPipe(ctx context.Context, wg *sync.WaitGroup, pipe io.Reader, out cha
 			}
 		}
 	}
+}
+
+// validateWorkingDir checks if command arguments contain paths that would escape
+// the working directory boundary. This provides basic protection in dev mode.
+func validateWorkingDir(cmd *CommandRequest) error {
+	if cmd.WorkingDir == "" {
+		return nil
+	}
+
+	// Ensure working directory is absolute
+	if !filepath.IsAbs(cmd.WorkingDir) {
+		return fmt.Errorf("working directory must be absolute, got: %s", cmd.WorkingDir)
+	}
+
+	// Clean the working directory path
+	workDir := filepath.Clean(cmd.WorkingDir)
+
+	// Check all arguments for suspicious path patterns
+	for _, arg := range cmd.Args {
+		// Check if argument looks like a file path
+		if strings.Contains(arg, "/") || strings.Contains(arg, "\\") {
+			// Try to resolve relative paths against working directory
+			var absPath string
+			if filepath.IsAbs(arg) {
+				absPath = filepath.Clean(arg)
+			} else {
+				absPath = filepath.Clean(filepath.Join(workDir, arg))
+			}
+
+			// Check if resolved path is outside working directory
+			relPath, err := filepath.Rel(workDir, absPath)
+			if err != nil || strings.HasPrefix(relPath, "..") {
+				return fmt.Errorf("path %q escapes working directory %q (resolves to %q)", arg, workDir, absPath)
+			}
+		}
+	}
+
+	return nil
 }

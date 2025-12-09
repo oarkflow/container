@@ -17,7 +17,15 @@ func main() {
 	vsockPort := flag.Uint("vsock-port", 0, "AF_VSOCK port to listen on (Linux guests)")
 	chunkSize := flag.Int("chunk", 32*1024, "Chunk size for stdout/stderr streaming")
 	maxBuffer := flag.Int("max-buffer", 4*1024*1024, "Maximum bytes to retain per stream in the final result")
+	rootDir := flag.String("root", "", "Root directory to restrict all operations to (for isolation)")
+	useChroot := flag.Bool("chroot", true, "Use chroot for OS-level isolation (requires root on Unix, enabled by default)")
+	noChroot := flag.Bool("no-chroot", false, "Disable chroot isolation (INSECURE - only for development)")
 	flag.Parse()
+
+	// Override chroot if explicitly disabled
+	if *noChroot {
+		*useChroot = false
+	}
 
 	if *unixPath == "" && *vsockPort == 0 {
 		fmt.Fprintln(os.Stderr, "agentd requires -unix or -vsock-port")
@@ -25,10 +33,27 @@ func main() {
 	}
 
 	logger := log.New(os.Stdout, "[agentd] ", log.LstdFlags)
+
+	// Warn about chroot requirements
+	if *useChroot && *rootDir == "" {
+		logger.Println("warning: -chroot specified but -root not set, chroot will not be used")
+		*useChroot = false
+	}
+
+	// Warn if chroot is disabled
+	if !*useChroot && *rootDir != "" {
+		logger.Println("WARNING: chroot isolation is DISABLED - this is INSECURE for untrusted code!")
+		logger.Println("WARNING: Scripts can escape the root directory restriction!")
+		logger.Println("WARNING: Only use --no-chroot for development with trusted code!")
+	}
+
 	srv := agent.NewServer(agent.ServerConfig{
 		ChunkSize:       *chunkSize,
 		MaxResultBuffer: *maxBuffer,
 		Logger:          logger,
+		RootDir:         *rootDir,
+		UseChrootIfRoot: *useChroot,
+		AllowInsecure:   !*useChroot, // Allow insecure mode when chroot is disabled
 	})
 
 	listeners := make([]net.Listener, 0, 2)

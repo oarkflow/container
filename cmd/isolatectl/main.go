@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -12,6 +13,21 @@ import (
 	"github.com/oarkflow/container/pkg/isolate"
 	runtimectl "github.com/oarkflow/container/pkg/isolate/runtime"
 )
+
+func getDefaultSocketPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "./agent.sock"
+	}
+	return filepath.Join(homeDir, ".container", "agent.sock")
+}
+
+func getDefaultRootDir() string {
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return "."
+}
 
 func main() {
 	os.Exit(run())
@@ -25,12 +41,14 @@ func run() int {
 	memory := flag.Int64("memory", 512*1024*1024, "Memory in bytes")
 	cpus := flag.Int("cpus", 2, "Number of vCPUs")
 	devMode := flag.Bool("dev", false, "Use loopback agent for local testing (executes on host)")
-	agentUnix := flag.String("agent-unix", "", "Path to a Unix socket exposed by the guest agent")
+	agentUnix := flag.String("agent-unix", "", "Path to a Unix socket (default: ~/.container/agent.sock)")
+	autoAgent := flag.Bool("auto-agent", true, "Automatically start/manage agent daemon")
+	noAgent := flag.Bool("no-agent", false, "Disable agent mode and use full VM (requires --image)")
 	agentVsockCID := flag.Uint("agent-vsock-cid", 3, "vsock CID for the guest (Linux only)")
 	agentVsockPort := flag.Uint("agent-vsock-port", 0, "vsock port for the guest agent (requires CID)")
-	rootDir := flag.String("root", "", "Host directory to mount inside the guest")
+	rootDir := flag.String("root", "", "Root directory for agent isolation (default: current directory)")
 	workdir := flag.String("workdir", "/workspace", "Guest working directory (used with --root)")
-	cmdFlag := flag.String("cmd", "", "Command to execute inside the container (overrides positional args)")
+	cmdFlag := flag.String("cmd", "", "Command to execute as a shell command (not recommended with isolated agent)")
 	flag.Parse()
 
 	if *listRuntimes {
@@ -39,9 +57,49 @@ func run() int {
 	}
 
 	if *cmdFlag == "" && flag.NArg() == 0 {
-		fmt.Println("usage: isolatectl [flags] --cmd \"<command>\" or isolatectl [flags] <command> [args...]")
+		fmt.Println("usage: isolatectl [flags] <command> [args...]")
+		fmt.Println("\nExamples:")
+		fmt.Println("  isolatectl cat file.txt              # Uses default agent at ~/.container/agent.sock")
+		fmt.Println("  isolatectl ls -la                    # Auto-starts agent if needed")
+		fmt.Println("  isolatectl --root=/data cat file.txt # Restricts operations to /data")
 		flag.PrintDefaults()
 		return 1
+	}
+
+	// Set default socket path if not provided (unless explicitly disabled)
+	if *agentUnix == "" && !*noAgent {
+		*agentUnix = getDefaultSocketPath()
+	}
+
+	// Determine if we're using direct agent mode (agent-unix without VM)
+	usingDirectAgent := *agentUnix != "" && !*devMode && !*noAgent
+
+	// Set default root directory for agent isolation
+	agentRootDir := ""
+	if usingDirectAgent {
+		if *rootDir != "" {
+			agentRootDir = *rootDir
+		} else {
+			agentRootDir = getDefaultRootDir()
+		}
+	}
+
+	// Start agent manager if auto-agent is enabled
+	var agentMgr *isolate.AgentManager
+	if *autoAgent && usingDirectAgent && *agentVsockPort == 0 {
+		agentMgr = isolate.NewAgentManager(*agentUnix, agentRootDir)
+		if err := agentMgr.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to start agent: %v\n", err)
+			fmt.Fprintln(os.Stderr, "continuing without auto-managed agent...")
+		} else {
+			defer agentMgr.Stop()
+			fmt.Fprintf(os.Stderr, "[agent] started at %s (root: %s)\n", *agentUnix, agentRootDir)
+		}
+	}
+
+	// If using direct agent mode, execute directly without creating a VM
+	if usingDirectAgent {
+		return runDirectAgent(ctx, *agentUnix, agentRootDir, *cmdFlag, flag.Args())
 	}
 
 	manager, err := isolate.NewDefaultManager()
@@ -60,14 +118,38 @@ func run() int {
 		metadata["agent.vsock.port"] = fmt.Sprintf("%d", *agentVsockPort)
 	}
 
-	mounts := make([]runtimectl.Mount, 0, 1)
+	// Resolve root directory to absolute path if provided
+	var absRootDir string
 	if *rootDir != "" {
+		var err error
+		absRootDir, err = filepath.Abs(*rootDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to resolve root directory: %v\n", err)
+			return 1
+		}
+	}
+
+	mounts := make([]runtimectl.Mount, 0, 1)
+	if absRootDir != "" {
+		// In dev mode, workdir must be absolute and point to the mounted location
+		var targetPath string
+		if *devMode {
+			// For dev mode, use the absolute host path as the working directory
+			targetPath = absRootDir
+		} else {
+			// For real VM mode, use the guest path
+			targetPath = *workdir
+		}
+
 		mounts = append(mounts, runtimectl.Mount{
-			Source:   *rootDir,
-			Target:   *workdir,
+			Source:   absRootDir,
+			Target:   targetPath,
 			Type:     runtimectl.MountTypeBind,
 			ReadOnly: false,
 		})
+
+		// Update workdir to use the target path
+		*workdir = targetPath
 	}
 
 	cfg := &isolate.Config{
@@ -95,6 +177,11 @@ func run() int {
 
 	if *devMode {
 		fmt.Fprintln(os.Stderr, "[warning] dev mode executes commands directly on this host. Use only for testing.")
+		if absRootDir != "" {
+			fmt.Fprintf(os.Stderr, "[warning] commands will be restricted to: %s\n", absRootDir)
+		} else {
+			fmt.Fprintln(os.Stderr, "[warning] no root directory specified - commands will run unrestricted!")
+		}
 	}
 
 	if err := container.Start(ctx); err != nil {
@@ -149,6 +236,59 @@ func run() int {
 	return result.ExitCode
 }
 
+// runDirectAgent executes a command directly via the agent without creating a VM
+func runDirectAgent(ctx context.Context, socketPath, rootDir, cmdFlag string, positionalArgs []string) int {
+	// Connect to agent
+	client := isolate.NewAgentClient(socketPath)
+
+	// Resolve command
+	cmdPath, cmdArgs := resolveCommand(cmdFlag, positionalArgs)
+	if cmdPath == "" {
+		fmt.Fprintln(os.Stderr, "no command provided")
+		return 1
+	}
+
+	// Check if command is a shell and warn about script execution
+	if isShellCommand(cmdPath) && len(cmdArgs) > 0 {
+		// Check if script file exists and validate it's within root
+		for _, arg := range cmdArgs {
+			if !strings.HasPrefix(arg, "-") && (strings.HasSuffix(arg, ".sh") || strings.HasSuffix(arg, ".bash")) {
+				fmt.Fprintf(os.Stderr, "[warning] executing script %q - script contents are NOT validated for path escaping\n", arg)
+				break
+			}
+		}
+	}
+
+	// Create command request
+	command := &isolate.Command{
+		Path:       cmdPath,
+		Args:       cmdArgs,
+		Env:        map[string]string{},
+		WorkingDir: rootDir,
+	}
+
+	// Execute command
+	result, err := client.Exec(ctx, command)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
+		return 1
+	}
+
+	// Write output
+	if len(result.Stdout) > 0 {
+		if _, err := os.Stdout.Write(result.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "write stdout: %v\n", err)
+		}
+	}
+	if len(result.Stderr) > 0 {
+		if _, err := os.Stderr.Write(result.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "write stderr: %v\n", err)
+		}
+	}
+
+	return result.ExitCode
+}
+
 func describeRuntimes() {
 	targetOS := runtime.GOOS
 	descriptors := runtimectl.AvailableRuntimes(targetOS)
@@ -180,6 +320,17 @@ func shellCommandForHost(command string) (string, []string) {
 		return "cmd.exe", []string{"/C", command}
 	}
 	return "/bin/sh", []string{"-c", command}
+}
+
+func isShellCommand(cmdPath string) bool {
+	shells := []string{"sh", "bash", "zsh", "fish", "ksh", "cmd.exe", "powershell.exe", "pwsh.exe"}
+	baseName := filepath.Base(cmdPath)
+	for _, shell := range shells {
+		if baseName == shell || strings.HasSuffix(baseName, "/"+shell) || strings.HasSuffix(baseName, "\\"+shell) {
+			return true
+		}
+	}
+	return false
 }
 
 func printStatus(status *isolate.Status) {
